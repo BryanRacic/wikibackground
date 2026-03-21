@@ -139,7 +139,7 @@ Description=Set desktop wallpaper from Wikimedia Commons
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /home/bryan/Development/wikibackground/wikibackground.py -c featured nature landscapes astronomy -v
+ExecStart=/usr/bin/python3 /home/YOUR_USER/wikibackground/wikibackground.py -c featured nature landscapes astronomy -v
 ```
 
 **Step 2:** Create the timer unit:
@@ -194,13 +194,13 @@ Add a line to change the wallpaper on a schedule. The script automatically sets 
 
 ```cron
 # Every 6 hours
-0 */6 * * * /usr/bin/python3 /home/bryan/Development/wikibackground/wikibackground.py
+0 */6 * * * /usr/bin/python3 /home/YOUR_USER/wikibackground/wikibackground.py
 
 # Every day at 8am, from nature or landscapes, verbose log to a file
-0 8 * * * /usr/bin/python3 /home/bryan/Development/wikibackground/wikibackground.py -c nature landscapes -v 2>> /tmp/wikibackground.log
+0 8 * * * /usr/bin/python3 /home/YOUR_USER/wikibackground/wikibackground.py -c nature landscapes -v 2>> /tmp/wikibackground.log
 
 # Every 30 minutes, 4K images only
-*/30 * * * * /usr/bin/python3 /home/bryan/Development/wikibackground/wikibackground.py --min-width 3840 --min-height 2160
+*/30 * * * * /usr/bin/python3 /home/YOUR_USER/wikibackground/wikibackground.py --min-width 3840 --min-height 2160
 ```
 
 > **Note:** Use full absolute paths for both `python3` and the script. Find your Python path with `which python3`.
@@ -211,10 +211,10 @@ For quick manual use, add an alias to your `~/.bashrc` or `~/.zshrc`:
 
 ```bash
 # Simple alias
-alias wallpaper='/usr/bin/python3 /home/bryan/Development/wikibackground/wikibackground.py'
+alias wallpaper='/usr/bin/python3 /home/YOUR_USER/wikibackground/wikibackground.py'
 
 # Alias with your preferred defaults
-alias wallpaper='/usr/bin/python3 /home/bryan/Development/wikibackground/wikibackground.py -c featured nature landscapes -v'
+alias wallpaper='/usr/bin/python3 /home/YOUR_USER/wikibackground/wikibackground.py -c featured nature landscapes -v'
 ```
 
 Then reload your shell:
@@ -237,10 +237,10 @@ To make `wikibackground` available as a command without the full path:
 
 ```bash
 # User-local (make sure ~/.local/bin is on your PATH)
-ln -s /home/bryan/Development/wikibackground/wikibackground.py ~/.local/bin/wikibackground
+ln -s /home/YOUR_USER/wikibackground/wikibackground.py ~/.local/bin/wikibackground
 
 # Or system-wide
-sudo ln -s /home/bryan/Development/wikibackground/wikibackground.py /usr/local/bin/wikibackground
+sudo ln -s /home/YOUR_USER/wikibackground/wikibackground.py /usr/local/bin/wikibackground
 ```
 
 ## How It Works
