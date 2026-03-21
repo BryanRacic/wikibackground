@@ -257,7 +257,7 @@ sudo ln -s /home/bryan/Development/wikibackground/wikibackground.py /usr/local/b
 
 ## AI Disclosure
 
-Generative AI was used in the generation of this program.
+Generative AI was used in the creation of this program.
 
 ## License
 
