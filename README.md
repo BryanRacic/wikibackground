@@ -1,6 +1,6 @@
 # wikibackground
 
-A single-file Python script that fetches a random image from [Wikimedia Commons](https://commons.wikimedia.org/) and sets it as your GNOME desktop wallpaper. No dependencies beyond the Python standard library.
+A single-file Python script that fetches a random image from [Wikimedia Commons](https://commons.wikimedia.org/) and sets it as your desktop wallpaper on GNOME or Xfce. No dependencies beyond the Python standard library.
 
 > **Please be kind to Wikimedia Commons.** Their servers and bandwidth are funded by donations, and their API is offered freely without requiring an API key.
 
@@ -19,8 +19,14 @@ A single-file Python script that fetches a random image from [Wikimedia Commons]
 ## Requirements
 
 - Python 3.6+
-- GNOME desktop environment (`gsettings` must be on PATH)
+- GNOME (`gsettings` on PATH) **or** Xfce (`xfconf-query` + running `xfdesktop`)
 - Internet connection
+
+The script auto-detects the desktop environment at runtime, so the same
+invocation works on both. On Xfce it sets the wallpaper via `xfconf-query`
+on the `xfce4-desktop` channel for every connected monitor and calls
+`xfdesktop --reload` to refresh immediately. `--picture-option` values are
+translated to the equivalent Xfce `image-style` integers (0–6).
 
 ## Installation
 
@@ -31,6 +37,30 @@ chmod +x wikibackground.py
 ```
 
 That's it. No `pip install`, no virtualenv.
+
+## User-Agent (recommended)
+
+Wikimedia's [User-Agent policy](https://meta.wikimedia.org/wiki/User-Agent_policy)
+asks API clients to send a descriptive `User-Agent` that identifies the tool and
+gives a way to contact you. Requests with a generic, default, or missing
+User-Agent are rate-limited (you'll see `HTTP Error 429: Too Many Requests`) or
+blocked more aggressively.
+
+To set your own, copy the template and fill in your details:
+
+```bash
+cp user_agent.txt.example user_agent.txt
+# then edit user_agent.txt — replace YOUR_USERNAME / YOUR_EMAIL with your own
+```
+
+The script reads the first non-comment, non-blank line of `user_agent.txt` (in
+the repo directory) and sends it verbatim. If the file is missing, a generic
+default is used instead. `user_agent.txt` is git-ignored, so your contact info
+stays out of version control.
+
+> If you do hit a 429 anyway, the script automatically retries with backoff
+> (honouring the server's `Retry-After` header), so transient rate-limits
+> recover on their own rather than crashing the run.
 
 ## Usage
 
@@ -55,7 +85,7 @@ wikibackground.py [-c CATEGORY [CATEGORY ...]] [--min-width N] [--min-height N]
 | `--dry-run` | off | Download the image but don't change the wallpaper |
 | `-v, --verbose` | off | Print progress to stderr |
 | `--skip-if-running` | none | Skip the wallpaper change if any running process's command line contains one of the given substrings (case-insensitive). Reads `/proc/*/cmdline`; no root needed. Useful for not interrupting fullscreen games. Pass with no arguments to load patterns from `run_skip.csv` in the cache directory (auto-created with commented-out example entries on first use; edit it to enable). |
-| `--favorite` | off | Tag the currently-set wallpaper as a favorite in the log and exit (does not change the wallpaper). Reads the active wallpaper from `gsettings` so it works correctly after `--dry-run` or cache-reuse runs where the latest log entry isn't what's actually on screen. |
+| `--favorite` | off | Tag the currently-set wallpaper as a favorite in the log and exit (does not change the wallpaper). Reads the active wallpaper from the desktop (gsettings on GNOME, xfconf on Xfce) so it works correctly after `--dry-run` or cache-reuse runs where the latest log entry isn't what's actually on screen. |
 | `--blocklist` | off | Tag the currently-set wallpaper as blocklisted in the log and exit; blocklisted images are never picked again from cache or remote |
 | `--clear-cache` | off | Delete cached images and log entries that aren't favorited or blocklisted, then exit. Favorites are kept on disk and in the log; blocklisted images have their file deleted but their log entry preserved (so they stay blocked) |
 
@@ -118,7 +148,7 @@ The log drives two behaviours:
 - **Never re-download the same image.** Before picking a random candidate from Wikimedia Commons, the script consults the log and skips any title/URL it has already pulled — so each run reveals something new.
 - **Blocklist is permanent.** A blocklisted entry is filtered out of both the local cache (so cache-reuse won't pick it) and remote candidate lists (so it can never be re-downloaded). The local file itself will be removed on the next normal run unless `--keep-history` is set.
 
-`--favorite` and `--blocklist` act on the wallpaper that is *currently set* (read from `gsettings`), not necessarily the most recently logged download — the two diverge when the latest run was `--dry-run` or reused a cached image. If the current wallpaper has no matching log entry (e.g. set manually outside the script), the operation errors out and nothing is marked. Favorites currently just record the tag; future versions will use it to bias selection toward favorited images.
+`--favorite` and `--blocklist` act on the wallpaper that is *currently set* (read from `gsettings` on GNOME or `xfconf-query` on Xfce), not necessarily the most recently logged download — the two diverge when the latest run was `--dry-run` or reused a cached image. If the current wallpaper has no matching log entry (e.g. set manually outside the script), the operation errors out and nothing is marked. Favorites currently just record the tag; future versions will use it to bias selection toward favorited images.
 
 ## Process Skip List
 
@@ -329,7 +359,7 @@ sudo ln -s /home/YOUR_USER/wikibackground/wikibackground.py /usr/local/bin/wikib
 5. Queries image dimensions for up to 20 candidates per batch, looking for one that meets the minimum resolution
 6. If no match is found, fetches the next batch (up to 3 batches total)
 7. Downloads the image to the cache directory and appends an entry to `downloads.csv`
-8. Sets the wallpaper via `gsettings` (both `picture-uri` and `picture-uri-dark`)
+8. Sets the wallpaper: on GNOME via `gsettings` (both `picture-uri` and `picture-uri-dark`); on Xfce via `xfconf-query` on `/backdrop/screen0/monitor<name>/workspace0/{last-image,image-style,image-show}` for every connected monitor, followed by `xfdesktop --reload`
 9. Removes old images from the cache directory (unless `--keep-history` is set); the log itself is preserved
 
 ## AI Disclosure

@@ -1,0 +1,18 @@
+# wikibackground User-Agent
+#
+# Wikimedia's API User-Agent policy
+# (https://meta.wikimedia.org/wiki/User-Agent_policy) requires a descriptive
+# User-Agent that identifies the tool AND gives a way to contact you (a project
+# URL or an email address). Requests with a generic, default, or missing
+# User-Agent are rate-limited (HTTP 429: Too Many Requests) or blocked more
+# aggressively.
+#
+# Setup:
+#   1. Copy this file to "user_agent.txt" in the same directory:
+#        cp user_agent.txt.example user_agent.txt
+#   2. Edit the line below and replace YOUR_USERNAME / YOUR_EMAIL with your own.
+#
+# The first non-comment, non-blank line is sent verbatim as the User-Agent
+# header. If user_agent.txt is missing, a generic default is used instead.
+
+wikibackground/1.0 (https://github.com/BryanRacic/wikibackground; YOUR_EMAIL@example.com)

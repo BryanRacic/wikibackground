@@ -9,13 +9,42 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
 API_URL = "https://commons.wikimedia.org/w/api.php"
-USER_AGENT = "wikibackground/1.0 (https://github.com/; desktop wallpaper script) Python/urllib"
+
+# Wikimedia's API policy requires a descriptive User-Agent with contact info;
+# generic or missing ones get rate-limited (HTTP 429) or blocked. Users supply
+# their own by copying user_agent.txt.example -> user_agent.txt (see below).
+DEFAULT_USER_AGENT = "wikibackground/1.0 (https://github.com/BryanRacic/wikibackground)"
+USER_AGENT_FILE = Path(__file__).resolve().parent / "user_agent.txt"
+
+
+def _load_user_agent():
+    """Return the User-Agent from user_agent.txt, else DEFAULT_USER_AGENT.
+
+    The first non-comment, non-blank line of the file is used verbatim. Missing
+    or unreadable file falls back to the default (which is more likely to be
+    rate-limited, so users are encouraged to fill in their own contact info).
+    """
+    try:
+        for line in USER_AGENT_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line
+    except OSError:
+        pass
+    return DEFAULT_USER_AGENT
+
+
+USER_AGENT = _load_user_agent()
+
+# Network retry tuning for transient/rate-limit responses.
+MAX_API_RETRIES = 4
 DOWNLOAD_LOG = "downloads.csv"
 DOWNLOAD_LOG_FIELDS = ("timestamp", "title", "url", "filename", "favorite", "blocklist")
 SKIP_IF_RUNNING_LOG = "run_skip.csv"
@@ -51,14 +80,40 @@ def log(msg, verbose=True):
         print(msg, file=sys.stderr)
 
 
+def _retry_after_seconds(err, attempt):
+    """Seconds to wait before retrying: honour Retry-After, else exp. backoff."""
+    header = err.headers.get("Retry-After") if err.headers else None
+    if header:
+        try:
+            return max(1, int(header))  # delta-seconds form
+        except ValueError:
+            pass  # HTTP-date form (rare here) — fall back to backoff
+    return 2 ** attempt  # 1, 2, 4, 8s
+
+
 def api_request(params):
-    """Make a GET request to the Wikimedia Commons API."""
+    """Make a GET request to the Wikimedia Commons API.
+
+    Retries on rate-limiting (HTTP 429) and transient server errors (5xx),
+    honouring the Retry-After header when present, then re-raises if still
+    failing after MAX_API_RETRIES attempts.
+    """
     params["format"] = "json"
     query = urllib.parse.urlencode(params)
     url = f"{API_URL}?{query}"
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode())
+    for attempt in range(MAX_API_RETRIES):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < MAX_API_RETRIES - 1:
+                wait = _retry_after_seconds(e, attempt)
+                log(f"  API HTTP {e.code}; retrying in {wait}s "
+                    f"(attempt {attempt + 1}/{MAX_API_RETRIES})...")
+                time.sleep(wait)
+                continue
+            raise
 
 
 def fetch_category_members(category, cmcontinue=None):
@@ -78,23 +133,39 @@ def fetch_category_members(category, cmcontinue=None):
     return members, cont
 
 
-def get_image_info(title):
-    """Get image dimensions and download URL for a file."""
+def get_image_infos(titles):
+    """Get dimensions and download URLs for many files in a single request.
+
+    The MediaWiki API accepts up to 50 titles per query, so batching here turns
+    what used to be one HTTP request per candidate into one per batch — the main
+    lever for staying under the rate limit. Returns {requested_title: {"url",
+    "width", "height"}}; titles the API can't resolve are simply absent.
+    """
+    if not titles:
+        return {}
     data = api_request({
         "action": "query",
-        "titles": title,
+        "titles": "|".join(titles),
         "prop": "imageinfo",
         "iiprop": "url|size",
     })
-    pages = data.get("query", {}).get("pages", {})
-    for page in pages.values():
-        info = page.get("imageinfo", [{}])[0]
-        return {
+    query = data.get("query", {})
+    # The API may normalize titles (e.g. underscores -> spaces); map the
+    # returned page titles back to the exact strings we asked for.
+    norm = {n["to"]: n["from"] for n in query.get("normalized", [])}
+    infos = {}
+    for page in query.get("pages", {}).values():
+        imageinfo = page.get("imageinfo")
+        if not imageinfo:
+            continue
+        info = imageinfo[0]
+        key = norm.get(page.get("title"), page.get("title"))
+        infos[key] = {
             "url": info.get("url"),
             "width": info.get("width", 0),
             "height": info.get("height", 0),
         }
-    return None
+    return infos
 
 
 def download_image(url, dest_path):
@@ -105,18 +176,42 @@ def download_image(url, dest_path):
             shutil.copyfileobj(resp, f)
 
 
-def _gsettings_env():
-    """Build an env that lets gsettings talk to the user's session bus from cron."""
+XFCE_STYLE_MAP = {
+    "none": 0, "centered": 1, "wallpaper": 2, "stretched": 3,
+    "scaled": 4, "zoom": 5, "spanned": 6,
+}
+
+
+def _session_env():
+    """Build an env that lets gsettings/xfconf talk to the user's session bus from cron."""
     env = os.environ.copy()
     uid = os.getuid()
     env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+    env.setdefault("DISPLAY", ":0")
     return env
 
 
-def set_wallpaper(image_path, picture_option):
+def detect_desktop():
+    """Return 'xfce' or 'gnome' based on the running session / available tools."""
+    current = os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
+    if "XFCE" in current:
+        return "xfce"
+    if "GNOME" in current:
+        return "gnome"
+    # Cron has no XDG_CURRENT_DESKTOP — fall back to process detection.
+    if shutil.which("xfconf-query") and subprocess.run(
+        ["pgrep", "-x", "xfdesktop"], capture_output=True
+    ).returncode == 0:
+        return "xfce"
+    if shutil.which("gsettings"):
+        return "gnome"
+    return "unknown"
+
+
+def set_wallpaper_gnome(image_path, picture_option):
     """Set the GNOME desktop wallpaper via gsettings."""
     uri = f"file://{image_path}"
-    env = _gsettings_env()
+    env = _session_env()
 
     for key in ("picture-uri", "picture-uri-dark"):
         subprocess.run(
@@ -129,19 +224,91 @@ def set_wallpaper(image_path, picture_option):
     )
 
 
-def get_current_wallpaper_filename():
-    """Return the basename of the currently-set GNOME wallpaper, or None on error.
+def _xrandr_monitors(env):
+    """Return connected xrandr output names, e.g. ['DP-2', 'DP-3']."""
+    result = subprocess.run(
+        ["xrandr", "--listmonitors"], env=env, capture_output=True, text=True, check=True,
+    )
+    names = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if parts and parts[0].rstrip(":").isdigit():
+            names.append(parts[-1])
+    return names
 
-    Reads org.gnome.desktop.background/picture-uri via gsettings. Returns None
-    if gsettings isn't available, returns no value, or the value isn't a
-    file:// URI we can parse.
-    """
+
+def set_wallpaper_xfce(image_path, picture_option, verbose):
+    """Set the Xfce desktop wallpaper via xfconf-query on all monitor backdrops."""
+    env = _session_env()
+    style = XFCE_STYLE_MAP.get(picture_option, 5)
+    path_str = str(image_path)
+
+    result = subprocess.run(
+        ["xfconf-query", "-c", "xfce4-desktop", "-l"],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    last_image_props = sorted(
+        line.strip() for line in result.stdout.splitlines()
+        if line.strip().endswith("/last-image")
+    )
+
+    if not last_image_props:
+        # Fresh xfdesktop: no backdrop props populated yet. Synthesize them
+        # for every connected monitor so xfdesktop picks up the wallpaper.
+        monitors = _xrandr_monitors(env)
+        if not monitors:
+            raise RuntimeError("xfconf has no backdrops and xrandr found no monitors")
+        last_image_props = [
+            f"/backdrop/screen0/monitor{m}/workspace0/last-image" for m in monitors
+        ]
+        log(f"Creating xfce4-desktop backdrop properties for monitors: {monitors}", verbose)
+
+    for prop in last_image_props:
+        style_prop = prop.replace("/last-image", "/image-style")
+        show_prop = prop.replace("/last-image", "/image-show")
+        # --create is a no-op if the property already exists with the same type.
+        subprocess.run(
+            ["xfconf-query", "-c", "xfce4-desktop", "-p", prop,
+             "--create", "-t", "string", "-s", path_str],
+            env=env, check=False,
+        )
+        subprocess.run(
+            ["xfconf-query", "-c", "xfce4-desktop", "-p", style_prop,
+             "--create", "-t", "int", "-s", str(style)],
+            env=env, check=False,
+        )
+        subprocess.run(
+            ["xfconf-query", "-c", "xfce4-desktop", "-p", show_prop,
+             "--create", "-t", "bool", "-s", "true"],
+            env=env, check=False,
+        )
+
+    # Force xfdesktop to re-render immediately.
+    if shutil.which("xfdesktop"):
+        subprocess.run(["xfdesktop", "--reload"], env=env, check=False)
+
+
+def set_wallpaper(image_path, picture_option, verbose=False):
+    desktop = detect_desktop()
+    if desktop == "xfce":
+        set_wallpaper_xfce(image_path, picture_option, verbose)
+    elif desktop == "gnome":
+        set_wallpaper_gnome(image_path, picture_option)
+    else:
+        raise RuntimeError(
+            "Could not detect desktop environment. "
+            "Neither XFCE (xfconf-query + xfdesktop) nor GNOME (gsettings) available."
+        )
+
+
+def _current_wallpaper_filename_gnome():
+    """GNOME: read org.gnome.desktop.background/picture-uri via gsettings."""
     if not shutil.which("gsettings"):
         return None
     try:
         result = subprocess.run(
             ["gsettings", "get", "org.gnome.desktop.background", "picture-uri"],
-            env=_gsettings_env(), capture_output=True, text=True, check=True,
+            env=_session_env(), capture_output=True, text=True, check=True,
         )
     except (subprocess.CalledProcessError, OSError):
         return None
@@ -159,6 +326,51 @@ def get_current_wallpaper_filename():
     if not path_str:
         return None
     return Path(path_str).name
+
+
+def _current_wallpaper_filename_xfce():
+    """Xfce: read the first /backdrop/.../last-image via xfconf-query.
+
+    set_wallpaper_xfce writes the same path to every monitor's last-image, so
+    picking the first one is enough to identify the current wallpaper.
+    """
+    if not shutil.which("xfconf-query"):
+        return None
+    env = _session_env()
+    try:
+        listing = subprocess.run(
+            ["xfconf-query", "-c", "xfce4-desktop", "-l"],
+            env=env, capture_output=True, text=True, check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    props = sorted(
+        line.strip() for line in listing.stdout.splitlines()
+        if line.strip().endswith("/last-image")
+    )
+    if not props:
+        return None
+    try:
+        value = subprocess.run(
+            ["xfconf-query", "-c", "xfce4-desktop", "-p", props[0]],
+            env=env, capture_output=True, text=True, check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    path_str = value.stdout.strip()
+    if not path_str:
+        return None
+    return Path(path_str).name
+
+
+def get_current_wallpaper_filename():
+    """Return the basename of the currently-set wallpaper, or None on error."""
+    desktop = detect_desktop()
+    if desktop == "xfce":
+        return _current_wallpaper_filename_xfce()
+    if desktop == "gnome":
+        return _current_wallpaper_filename_gnome()
+    return None
 
 
 def clean_old_images(directory, current_file):
@@ -211,7 +423,7 @@ def mark_current_wallpaper(log_path, field, current_filename):
 
     Returns (row, status):
       - ("<row>", "matched"):   tagged the entry for current_filename
-      - ("<row>", "unknown"):   current_filename was None (gsettings unavailable);
+      - ("<row>", "unknown"):   current_filename was None (desktop reader failed);
                                 tagged the most recent entry as a fallback
       - (None,    "not_found"): current_filename didn't match any log entry
       - (None,    "empty"):     log has no entries
@@ -375,22 +587,24 @@ def find_suitable_image(category, min_width, min_height, seen_titles, seen_urls,
             and m["title"] not in seen_titles
         ]
         random.shuffle(candidates)
+        candidates = candidates[:MAX_CANDIDATES_PER_BATCH]
         log(f"  {len(candidates)} fresh image candidates in this batch.", verbose)
 
-        for candidate in candidates[:MAX_CANDIDATES_PER_BATCH]:
+        # One imageinfo request for the whole batch instead of one per title.
+        infos = get_image_infos([c["title"] for c in candidates])
+        for candidate in candidates:
             title = candidate["title"]
-            log(f"  Checking {title}...", verbose)
-            info = get_image_info(title)
+            info = infos.get(title)
             if not info or not info["url"]:
                 continue
             if info["url"] in seen_urls:
-                log(f"  Already downloaded (url match), rerolling.", verbose)
+                log(f"  {title}: already downloaded (url match), skipping.", verbose)
                 continue
             if info["width"] >= min_width and info["height"] >= min_height:
-                log(f"  Found: {info['width']}x{info['height']}", verbose)
+                log(f"  Found: {title} {info['width']}x{info['height']}", verbose)
                 return title, info
             else:
-                log(f"  Too small: {info['width']}x{info['height']}", verbose)
+                log(f"  Too small: {title} {info['width']}x{info['height']}", verbose)
 
         if not cmcontinue:
             log("No more batches available.", verbose)
@@ -443,7 +657,7 @@ def main():
     log_path = cache_dir / DOWNLOAD_LOG
 
     # Tag-only fast path: --favorite / --blocklist mark the wallpaper currently
-    # set by gsettings (not just the latest download — the two diverge after
+    # set on the desktop (not just the latest download — the two diverge after
     # --dry-run or cache-reuse runs).
     if args.favorite or args.blocklist:
         field = "favorite" if args.favorite else "blocklist"
@@ -461,8 +675,8 @@ def main():
             sys.exit(1)
         if status == "unknown":
             print(
-                "Warning: couldn't read current wallpaper from gsettings; marked the "
-                "most recent download instead.",
+                "Warning: couldn't read current wallpaper from the desktop environment; "
+                "marked the most recent download instead.",
                 file=sys.stderr,
             )
         print(f"Marked {row['filename']} as {field}.")
@@ -496,10 +710,14 @@ def main():
     categories = [CATEGORY_ALIASES.get(c, c) for c in args.category]
     category = random.choice(categories)
 
-    # Validate gsettings exists (unless dry-run)
-    if not args.dry_run and not shutil.which("gsettings"):
-        print("Error: gsettings not found on PATH. Is GNOME installed?", file=sys.stderr)
-        sys.exit(1)
+    # Validate a supported desktop is available (unless dry-run)
+    if not args.dry_run:
+        desktop = detect_desktop()
+        if desktop == "unknown":
+            print("Error: no supported desktop detected. Need gsettings (GNOME) or "
+                  "xfconf-query + xfdesktop (Xfce).", file=sys.stderr)
+            sys.exit(1)
+        log(f"Detected desktop: {desktop}", verbose)
 
     # Load the download log once; used for cache filtering and remote dedupe.
     log_rows = load_download_log(log_path)
@@ -525,7 +743,7 @@ def main():
         if args.dry_run:
             log("Dry run — wallpaper not changed.", verbose)
         else:
-            set_wallpaper(dest, args.picture_option)
+            set_wallpaper(dest, args.picture_option, verbose)
             log(f"Wallpaper set ({args.picture_option}).", verbose)
 
         print(dest)
@@ -556,7 +774,7 @@ def main():
     if args.dry_run:
         log("Dry run — wallpaper not changed.", verbose)
     else:
-        set_wallpaper(dest, args.picture_option)
+        set_wallpaper(dest, args.picture_option, verbose)
         log(f"Wallpaper set ({args.picture_option}).", verbose)
 
     if not args.keep_history:
