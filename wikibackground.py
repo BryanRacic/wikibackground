@@ -7,6 +7,7 @@ import json
 import os
 import random
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -812,27 +813,51 @@ def main():
         print(dest)
         return
 
-    # Download a new image
+    # Download a new image. If the network is unavailable (offline, DNS failure,
+    # connection refused, timeout, or the API still erroring after retries), fall
+    # back to a cached image rather than crashing — so a cron run without a
+    # connection still rotates the wallpaper instead of leaving a traceback. We
+    # only error out if the cache is empty too.
     log(f"Category: {category}", verbose)
     log(f"Min resolution: {args.min_width}x{args.min_height}", verbose)
     log(f"{len(seen_titles)} prior downloads on record ({len(blocked_filenames)} blocklisted).", verbose)
 
-    result = find_suitable_image(
-        category, args.min_width, args.min_height, seen_titles, seen_urls, verbose,
-    )
-    if not result:
-        print("Error: no suitable image found.", file=sys.stderr)
-        sys.exit(1)
+    try:
+        result = find_suitable_image(
+            category, args.min_width, args.min_height, seen_titles, seen_urls, verbose,
+        )
+        if not result:
+            print("Error: no suitable image found.", file=sys.stderr)
+            sys.exit(1)
 
-    title, info = result
-    # Derive filename from title (strip "File:" prefix)
-    filename = title.replace("File:", "").replace(" ", "_")
-    dest = cache_dir / filename
+        title, info = result
+        # Derive filename from title (strip "File:" prefix)
+        filename = title.replace("File:", "").replace(" ", "_")
+        dest = cache_dir / filename
 
-    log(f"Downloading {info['url']}...", verbose)
-    download_image(info["url"], dest)
-    log(f"Saved to {dest}", verbose)
-    record_download(log_path, title, info["url"], filename)
+        log(f"Downloading {info['url']}...", verbose)
+        download_image(info["url"], dest)
+        log(f"Saved to {dest}", verbose)
+        record_download(log_path, title, info["url"], filename)
+    except (urllib.error.URLError, socket.timeout) as e:
+        # urllib.error.HTTPError is a URLError subclass, so retry-exhausted 5xx/429
+        # responses land here too. Fall back to a cached image when one exists.
+        if not cached_images:
+            print(f"Error: network request failed ({e}) and no cached image to "
+                  "fall back on.", file=sys.stderr)
+            sys.exit(1)
+        dest = random.choice(cached_images)
+        log(f"Network request failed ({e}); reusing cached image: {dest}", verbose=True)
+
+        if args.dry_run:
+            log("Dry run — wallpaper not changed.", verbose)
+        else:
+            set_wallpaper(dest, args.picture_option, verbose)
+            log(f"Wallpaper set ({args.picture_option}).", verbose)
+
+        # No new download, so skip clean_old_images — the cache is the fallback.
+        print(dest)
+        return
 
     if args.dry_run:
         log("Dry run — wallpaper not changed.", verbose)

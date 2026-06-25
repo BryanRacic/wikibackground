@@ -15,12 +15,13 @@ A single-file Python script that fetches a random image from [Wikimedia Commons]
 - Tracks every download in a CSV log so the same image is never fetched twice
 - Mark the current wallpaper as a `--favorite` or `--blocklist` it so it's never shown again
 - Skip the wallpaper change while a fullscreen game (or any named process) is running
+- Falls back to a cached image when offline, so scheduled runs survive a missing connection
 
 ## Requirements
 
 - Python 3.6+
 - GNOME (`gsettings` on PATH), KDE Plasma (`plasma-apply-wallpaperimage` on PATH), **or** Xfce (`xfconf-query` + running `xfdesktop`)
-- Internet connection
+- Internet connection (to fetch new images; if it's down, the script reuses a previously cached image instead — see [Offline Behavior](#offline-behavior))
 
 The script auto-detects the desktop environment at runtime, so the same
 invocation works across all three. On KDE Plasma it sets the wallpaper via
@@ -220,6 +221,26 @@ You can mix aliases and full names:
 ./wikibackground.py -c featured nature Featured_pictures_of_buildings
 ```
 
+## Offline Behavior
+
+The script needs the network only to *discover and download new* images. If a
+request to Wikimedia Commons fails — no connection, DNS failure, a timeout, or
+the API still returning errors after the built-in retries — it falls back to a
+random image already in the cache directory instead of crashing. This is what
+keeps a `cron`/`systemd` run useful on a laptop that happens to be offline at
+the scheduled time: the wallpaper still rotates among images you've collected.
+
+A few details:
+
+- Blocklisted images are excluded from the fallback, just like normal cache reuse.
+- Favorites and `--keep-history` build up the pool the fallback draws from, so
+  the more you cache, the more variety you get while offline.
+- If the network is down **and** the cache is empty (e.g. a brand-new install),
+  the script prints an error and exits non-zero
+- HTTP `429`/`5xx` responses are retried first (with backoff, honouring
+  `Retry-After`); the cache fallback only kicks in once those retries are
+  exhausted.
+
 ## Automating Wallpaper Changes
 
 ### Option 1: systemd Timer (recommended)
@@ -306,6 +327,8 @@ Add a line to change the wallpaper on a schedule. The script automatically sets 
 > **Note:** Use full absolute paths for both `python3` and the script. Find your Python path with `which python3`.
 >
 > **Tip:** Pass `--skip-if-running` (no arguments) on every scheduled run so the script honours your `run_skip.csv` patterns and won't change the wallpaper while a fullscreen game is up. Without the flag, the skip logic is never consulted.
+>
+> **Offline:** If the machine has no connection when the job fires, the run won't fail — it reuses a cached image (provided one exists). See [Offline Behavior](#offline-behavior).
 
 ### Shell Alias
 
@@ -361,7 +384,7 @@ sudo ln -s /home/YOUR_USER/wikibackground/wikibackground.py /usr/local/bin/wikib
 4. Filters out non-image files (SVG, TIFF, video, etc.), drops any titles/URLs already in the download log, and shuffles the rest
 5. Queries image dimensions for up to 20 candidates per batch, looking for one that meets the minimum resolution
 6. If no match is found, fetches the next batch (up to 3 batches total)
-7. Downloads the image to the cache directory and appends an entry to `downloads.csv`
+7. Downloads the image to the cache directory and appends an entry to `downloads.csv` (if any of the network steps above fail, falls back to a random cached image instead — see [Offline Behavior](#offline-behavior))
 8. Sets the wallpaper: on GNOME via `gsettings` (both `picture-uri` and `picture-uri-dark`); on KDE Plasma via `plasma-apply-wallpaperimage --fill-mode <mode>` (applies to every screen); on Xfce via `xfconf-query` on `/backdrop/screen0/monitor<name>/workspace0/{last-image,image-style,image-show}` for every connected monitor, followed by `xfdesktop --reload`
 9. Removes old images from the cache directory (unless `--keep-history` is set); the log itself is preserved
 
