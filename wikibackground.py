@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch a random image from Wikimedia Commons and set it as the GNOME desktop wallpaper."""
+"""Fetch a random image from Wikimedia Commons and set it as the desktop wallpaper (GNOME/KDE/Xfce)."""
 
 import argparse
 import csv
@@ -181,6 +181,14 @@ XFCE_STYLE_MAP = {
     "scaled": 4, "zoom": 5, "spanned": 6,
 }
 
+# Map the GNOME-style picture-options onto the fill-mode names understood by
+# `plasma-apply-wallpaperimage --fill-mode` (KDE's org.kde.image plugin).
+KDE_FILL_MAP = {
+    "none": "center", "centered": "center", "wallpaper": "tile",
+    "stretched": "stretch", "scaled": "preserveAspectFit",
+    "zoom": "preserveAspectCrop", "spanned": "preserveAspectCrop",
+}
+
 
 def _session_env():
     """Build an env that lets gsettings/xfconf talk to the user's session bus from cron."""
@@ -192,13 +200,21 @@ def _session_env():
 
 
 def detect_desktop():
-    """Return 'xfce' or 'gnome' based on the running session / available tools."""
+    """Return 'kde', 'xfce', or 'gnome' based on the running session / available tools."""
     current = os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
+    if "KDE" in current or "PLASMA" in current:
+        return "kde"
     if "XFCE" in current:
         return "xfce"
     if "GNOME" in current:
         return "gnome"
     # Cron has no XDG_CURRENT_DESKTOP — fall back to process detection.
+    # Check KDE/Xfce before the gsettings fallback: Kubuntu ships gsettings,
+    # so the bare gsettings check would otherwise misidentify KDE as GNOME.
+    if shutil.which("plasma-apply-wallpaperimage") and subprocess.run(
+        ["pgrep", "-x", "plasmashell"], capture_output=True
+    ).returncode == 0:
+        return "kde"
     if shutil.which("xfconf-query") and subprocess.run(
         ["pgrep", "-x", "xfdesktop"], capture_output=True
     ).returncode == 0:
@@ -288,16 +304,33 @@ def set_wallpaper_xfce(image_path, picture_option, verbose):
         subprocess.run(["xfdesktop", "--reload"], env=env, check=False)
 
 
+def set_wallpaper_kde(image_path, picture_option, verbose):
+    """Set the KDE Plasma wallpaper via plasma-apply-wallpaperimage (all screens)."""
+    env = _session_env()
+    fill_mode = KDE_FILL_MAP.get(picture_option, "preserveAspectCrop")
+    cmd = ["plasma-apply-wallpaperimage", "--fill-mode", fill_mode, str(image_path)]
+    log(f"Running: {' '.join(cmd)}", verbose)
+    result = subprocess.run(env=env, args=cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "plasma-apply-wallpaperimage failed "
+            f"(exit {result.returncode}): {result.stderr.strip()}"
+        )
+
+
 def set_wallpaper(image_path, picture_option, verbose=False):
     desktop = detect_desktop()
-    if desktop == "xfce":
+    if desktop == "kde":
+        set_wallpaper_kde(image_path, picture_option, verbose)
+    elif desktop == "xfce":
         set_wallpaper_xfce(image_path, picture_option, verbose)
     elif desktop == "gnome":
         set_wallpaper_gnome(image_path, picture_option)
     else:
         raise RuntimeError(
-            "Could not detect desktop environment. "
-            "Neither XFCE (xfconf-query + xfdesktop) nor GNOME (gsettings) available."
+            "Could not detect desktop environment. None of KDE "
+            "(plasma-apply-wallpaperimage), XFCE (xfconf-query + xfdesktop), "
+            "or GNOME (gsettings) available."
         )
 
 
@@ -363,9 +396,39 @@ def _current_wallpaper_filename_xfce():
     return Path(path_str).name
 
 
+def _current_wallpaper_filename_kde():
+    """KDE: read the last Image= from plasma-org.kde.plasma.desktop-appletsrc.
+
+    plasma-apply-wallpaperimage writes the same path to every screen's
+    [Containments][N][Wallpaper][org.kde.image][General] Image= key, so the
+    last Image= line in the file identifies the current wallpaper.
+    """
+    config_home = os.environ.get(
+        "XDG_CONFIG_HOME", os.path.expanduser("~/.config")
+    )
+    config = Path(config_home) / "plasma-org.kde.plasma.desktop-appletsrc"
+    try:
+        text = config.read_text()
+    except OSError:
+        return None
+
+    raw = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("Image="):
+            raw = line[len("Image="):].strip()
+    if not raw:
+        return None
+    if raw.startswith("file://"):
+        raw = urllib.parse.unquote(raw[len("file://"):])
+    return Path(raw).name
+
+
 def get_current_wallpaper_filename():
     """Return the basename of the currently-set wallpaper, or None on error."""
     desktop = detect_desktop()
+    if desktop == "kde":
+        return _current_wallpaper_filename_kde()
     if desktop == "xfce":
         return _current_wallpaper_filename_xfce()
     if desktop == "gnome":
